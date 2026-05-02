@@ -33,7 +33,7 @@ type IntegrationInfo struct {
 	Description string
 }
 
-var launcherIntegrationOrder = []string{"opencode", "droid", "pi"}
+var launcherIntegrationOrder = []string{"openclaw", "claude", "opencode", "hermes", "codex", "copilot", "droid", "pi", "pool"}
 
 var integrationSpecs = []*IntegrationSpec{
 	{
@@ -72,6 +72,36 @@ var integrationSpecs = []*IntegrationSpec{
 			},
 			URL:     "https://developers.openai.com/codex/cli/",
 			Command: []string{"npm", "install", "-g", "@openai/codex"},
+		},
+	},
+	{
+		Name:        "kimi",
+		Runner:      &Kimi{},
+		Description: "Moonshot's coding agent for terminal and IDEs",
+		Hidden:      true,
+		Install: IntegrationInstallSpec{
+			CheckInstalled: func() bool {
+				_, err := exec.LookPath("kimi")
+				return err == nil
+			},
+			EnsureInstalled: func() error {
+				_, err := ensureKimiInstalled()
+				return err
+			},
+			URL: "https://moonshotai.github.io/kimi-cli/en/guides/getting-started.html",
+		},
+	},
+	{
+		Name:        "copilot",
+		Runner:      &Copilot{},
+		Aliases:     []string{"copilot-cli"},
+		Description: "GitHub's AI coding agent for the terminal",
+		Install: IntegrationInstallSpec{
+			CheckInstalled: func() bool {
+				_, err := (&Copilot{}).findPath()
+				return err == nil
+			},
+			URL: "https://github.com/features/copilot/cli/",
 		},
 	},
 	{
@@ -134,6 +164,32 @@ var integrationSpecs = []*IntegrationSpec{
 				return err
 			},
 			Command: []string{"npm", "install", "-g", "@mariozechner/pi-coding-agent@latest"},
+		},
+	},
+	{
+		Name:        "pool",
+		Runner:      &Poolside{},
+		Description: "Poolside's software agent for enterprise development",
+		Install: IntegrationInstallSpec{
+			CheckInstalled: func() bool {
+				_, err := exec.LookPath("pool")
+				return err == nil
+			},
+			URL: "https://github.com/poolsideai/pool",
+		},
+	},
+	{
+		Name:        "hermes",
+		Runner:      &Hermes{},
+		Description: "Self-improving AI agent built by Nous Research",
+		Install: IntegrationInstallSpec{
+			CheckInstalled: func() bool {
+				return (&Hermes{}).installed()
+			},
+			EnsureInstalled: func() error {
+				return (&Hermes{}).ensureInstalled()
+			},
+			URL: "https://hermes-agent.nousresearch.com/docs/getting-started/installation/",
 		},
 	},
 	{
@@ -241,6 +297,9 @@ func ListVisibleIntegrationSpecs() []IntegrationSpec {
 		if spec.Hidden {
 			continue
 		}
+		if spec.Name == "pool" && poolsideGOOS == "windows" {
+			continue
+		}
 		visible = append(visible, *spec)
 	}
 
@@ -255,10 +314,10 @@ func ListVisibleIntegrationSpecs() []IntegrationSpec {
 			return aRank - bRank
 		}
 		if aRank > 0 {
-			return 1
+			return -1
 		}
 		if bRank > 0 {
-			return -1
+			return 1
 		}
 		return strings.Compare(a.Name, b.Name)
 	})
@@ -353,6 +412,10 @@ func EnsureIntegrationInstalled(name string, runner Runner) error {
 	integration, err := integrationFor(name)
 	if err != nil {
 		return fmt.Errorf("%s is not installed", runner)
+	}
+
+	if integration.spec.Name == "pool" && poolsideGOOS == "windows" {
+		return poolsideUnsupportedError()
 	}
 
 	if integration.installed {

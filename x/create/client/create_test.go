@@ -311,9 +311,29 @@ func TestInferSafetensorsCapabilities(t *testing.T) {
 			name: "qwen3.5 multimodal model",
 			configJSON: `{
 				"architectures": ["Qwen3_5ForConditionalGeneration"],
-				"model_type": "qwen3"
+				"model_type": "qwen3",
+				"vision_config": {"hidden_size": 1024}
 			}`,
 			want: []string{"completion", "vision", "thinking"},
+		},
+		{
+			name: "model with audio config",
+			configJSON: `{
+				"architectures": ["Gemma4ForConditionalGeneration"],
+				"model_type": "gemma4",
+				"vision_config": {"hidden_size": 1024},
+				"audio_config": {"num_mel_bins": 128}
+			}`,
+			want: []string{"completion", "vision", "audio"},
+		},
+		{
+			name: "model with audio but no vision",
+			configJSON: `{
+				"architectures": ["SomeAudioModel"],
+				"model_type": "other",
+				"audio_config": {"num_mel_bins": 128}
+			}`,
+			want: []string{"completion", "audio"},
 		},
 		{
 			name: "non-qwen conditional generation model",
@@ -332,11 +352,79 @@ func TestInferSafetensorsCapabilities(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if got := inferSafetensorsCapabilities(dir); !slices.Equal(got, tt.want) {
+			if got := inferSafetensorsCapabilities(dir, ""); !slices.Equal(got, tt.want) {
 				t.Fatalf("inferSafetensorsCapabilities() = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
+}
+
+func TestParsePerExpertInputs(t *testing.T) {
+	makeInput := func(name, quantize string) create.PackedTensorInput {
+		return create.PackedTensorInput{Name: name, Quantize: quantize}
+	}
+
+	t.Run("uniform quant across projections", func(t *testing.T) {
+		inputs := []create.PackedTensorInput{
+			makeInput("layer.moe.experts.0.gate_proj.weight", "int4"),
+			makeInput("layer.moe.experts.1.gate_proj.weight", "int4"),
+			makeInput("layer.moe.experts.0.down_proj.weight", "int4"),
+			makeInput("layer.moe.experts.1.down_proj.weight", "int4"),
+		}
+		groups, projQ := parsePerExpertInputs("layer.moe.experts", inputs)
+		if groups == nil {
+			t.Fatal("expected non-nil groups")
+		}
+		if len(groups) != 2 {
+			t.Fatalf("expected 2 projection groups, got %d", len(groups))
+		}
+		if projQ["gate_proj.weight"] != "int4" {
+			t.Errorf("gate_proj quant = %q, want int4", projQ["gate_proj.weight"])
+		}
+		if projQ["down_proj.weight"] != "int4" {
+			t.Errorf("down_proj quant = %q, want int4", projQ["down_proj.weight"])
+		}
+	})
+
+	t.Run("mixed quant across projections", func(t *testing.T) {
+		inputs := []create.PackedTensorInput{
+			makeInput("layer.moe.experts.0.gate_proj.weight", "int4"),
+			makeInput("layer.moe.experts.1.gate_proj.weight", "int4"),
+			makeInput("layer.moe.experts.0.down_proj.weight", "int8"),
+			makeInput("layer.moe.experts.1.down_proj.weight", "int8"),
+		}
+		groups, projQ := parsePerExpertInputs("layer.moe.experts", inputs)
+		if groups == nil {
+			t.Fatal("expected non-nil groups for mixed cross-projection quant")
+		}
+		if projQ["gate_proj.weight"] != "int4" {
+			t.Errorf("gate_proj quant = %q, want int4", projQ["gate_proj.weight"])
+		}
+		if projQ["down_proj.weight"] != "int8" {
+			t.Errorf("down_proj quant = %q, want int8", projQ["down_proj.weight"])
+		}
+	})
+
+	t.Run("mixed quant within same projection rejected", func(t *testing.T) {
+		inputs := []create.PackedTensorInput{
+			makeInput("layer.moe.experts.0.down_proj.weight", "int4"),
+			makeInput("layer.moe.experts.1.down_proj.weight", "int8"),
+		}
+		groups, _ := parsePerExpertInputs("layer.moe.experts", inputs)
+		if groups != nil {
+			t.Fatal("expected nil for mixed quant within same projection")
+		}
+	})
+
+	t.Run("non-experts group rejected", func(t *testing.T) {
+		inputs := []create.PackedTensorInput{
+			makeInput("layer.mlp.gate_proj.weight", "int4"),
+		}
+		groups, _ := parsePerExpertInputs("layer.mlp", inputs)
+		if groups != nil {
+			t.Fatal("expected nil for non-experts group")
+		}
+	})
 }
 
 func TestQuantizeSupported(t *testing.T) {
@@ -467,6 +555,11 @@ func TestSupportsThinking(t *testing.T) {
 			want:       true,
 		},
 		{
+			name:       "laguna architecture without template",
+			configJSON: `{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`,
+			want:       false,
+		},
+		{
 			name:       "empty config",
 			configJSON: `{}`,
 			want:       false,
@@ -493,6 +586,55 @@ func TestSupportsThinking(t *testing.T) {
 func TestSupportsThinking_NoConfig(t *testing.T) {
 	if supportsThinking(t.TempDir()) {
 		t.Error("supportsThinking should return false for missing config.json")
+	}
+}
+
+func TestInferSafetensorsCapabilitiesFromParser(t *testing.T) {
+	tests := []struct {
+		name       string
+		parserName string
+		want       []string
+	}{
+		{
+			name:       "laguna tools and thinking",
+			parserName: "laguna",
+			want:       []string{"completion", "tools", "thinking"},
+		},
+		{
+			name:       "functiongemma tools only",
+			parserName: "functiongemma",
+			want:       []string{"completion", "tools"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := inferSafetensorsCapabilities(dir, tt.parserName); !slices.Equal(got, tt.want) {
+				t.Fatalf("inferSafetensorsCapabilities() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInferSafetensorsCapabilitiesLaguna(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := inferSafetensorsCapabilities(dir, "laguna")
+	for _, want := range []string{"completion", "tools", "thinking"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("capabilities %v missing %q", got, want)
+		}
+	}
+	if slices.Contains(got, "vision") || slices.Contains(got, "audio") {
+		t.Fatalf("unexpected non-text capability in %v", got)
 	}
 }
 
@@ -526,6 +668,11 @@ func TestGetParserName(t *testing.T) {
 			name:       "qwen3 via model_type",
 			configJSON: `{"model_type": "qwen3"}`,
 			want:       "qwen3",
+		},
+		{
+			name:       "laguna model",
+			configJSON: `{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`,
+			want:       "laguna",
 		},
 		{
 			name:       "no config",
@@ -571,6 +718,11 @@ func TestGetRendererName(t *testing.T) {
 			name:       "llama model (no renderer)",
 			configJSON: `{"architectures": ["LlamaForCausalLM"]}`,
 			want:       "",
+		},
+		{
+			name:       "laguna model",
+			configJSON: `{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`,
+			want:       "laguna",
 		},
 	}
 
