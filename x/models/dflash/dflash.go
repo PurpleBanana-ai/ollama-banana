@@ -1,12 +1,12 @@
-// Package dflash implements DFlash block-diffusion draft models for MLX.
+// Package dflash implements the DFlash block-diffusion draft model:
+// qwen3-shaped layers drafting a whole block per forward, conditioned on
+// tapped target hidden states as key/value context.
 package dflash
 
 import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
-	"strings"
 
 	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
@@ -17,127 +17,197 @@ import (
 )
 
 func init() {
-	base.RegisterDraft("DFlashDraftModel", newModel)
-	base.RegisterDraft("dflash", newModel)
+	base.RegisterDraft("DFlashDraftModel", func(root *model.Root, target base.Model) (base.DraftModel, error) {
+		return newModel(root, target, false)
+	})
+	base.RegisterDraft("DFlashLagunaForCausalLM", func(root *model.Root, target base.Model) (base.DraftModel, error) {
+		return newModel(root, target, true)
+	})
+	base.RegisterDraft("MuseGlimmerAssistantModel", func(root *model.Root, target base.Model) (base.DraftModel, error) {
+		return newModel(root, target, false)
+	})
 }
 
-var _ base.DFlashDraftModel = (*Model)(nil)
+var _ base.BlockDraft = (*Model)(nil)
 
 type Config struct {
-	HiddenSize            int32              `json:"hidden_size"`
-	NumHiddenLayers       int32              `json:"num_hidden_layers"`
-	NumAttentionHeads     int32              `json:"num_attention_heads"`
-	NumKeyValueHeads      int32              `json:"num_key_value_heads"`
-	HeadDim               int32              `json:"head_dim"`
-	IntermediateSize      int32              `json:"intermediate_size"`
-	VocabSize             int32              `json:"vocab_size"`
-	RMSNormEps            float32            `json:"rms_norm_eps"`
-	RopeTheta             float32            `json:"rope_theta"`
-	RopeScaling           *nn.RopeParameters `json:"rope_scaling"`
-	RopeParameters        *nn.RopeParameters `json:"rope_parameters"`
-	MaxPositionEmbeddings int32              `json:"max_position_embeddings"`
-	BlockSizeValue        int32              `json:"block_size"`
-	NumTargetLayers       int32              `json:"num_target_layers"`
-	LayerTypes            []string           `json:"layer_types"`
-	SlidingWindow         int32              `json:"sliding_window"`
-	FinalLogitSoftcapping *float32           `json:"final_logit_softcapping"`
-	DFlash                struct {
-		TargetLayerIDs []int `json:"target_layer_ids"`
-		MaskTokenID    int32 `json:"mask_token_id"`
-	} `json:"dflash_config"`
+	HiddenSize        int32
+	NumHiddenLayers   int32
+	NumAttentionHeads int32
+	NumKeyValueHeads  int32
+	HeadDim           int32
+	RMSNormEps        float32
+	RopeTheta         float32
+	Scale             float32
+	SlidingWindow     int32
+	LayerTypes        []string
 
-	QuantGroupSize int                               `json:"-"`
-	QuantBits      int                               `json:"-"`
-	QuantMode      string                            `json:"-"`
-	TensorQuant    map[string]*model.TensorQuantInfo `json:"-"`
-	Scale          float32                           `json:"-"`
-	RopeFreqs      *mlx.Array                        `json:"-"`
-	RopeScale      float32                           `json:"-"`
+	BlockSize      int
+	MaskTokenID    int32
+	VocabSize      int32
+	TargetLayerIDs []int
+
+	// RopeInterleaved selects the draft's rotary pairing convention:
+	// true pairs adjacent dims (torch view_as_complex over pairs, the glimmer
+	// publisher convention); false pairs split halves (HF rotate_half, the
+	// laguna convention). Defaults to false for backwards compatibility with
+	// laguna drafts.
+	RopeInterleaved bool
+
+	// Causal, when set, overrides every layer's attention direction;
+	// otherwise only sliding layers run causal.
+	Causal *bool
+}
+
+// draftTarget is what dflash requires of its target beyond base.Model.
+type draftTarget interface {
+	base.Model
+
+	// TokenEmbeddings is the raw table lookup; the draft has no table of
+	// its own.
+	TokenEmbeddings(ids *mlx.Array) *mlx.Array
+
+	// RawLogits is the raw head projection, skipping any output decoration
+	// the target's own Unembed applies.
+	RawLogits(hidden *mlx.Array) *mlx.Array
+
+	// SetAuxHiddenLayers taps layer outputs: id i means the hidden state
+	// after layer i, the same convention as checkpoint target_layer_ids.
+	SetAuxHiddenLayers(layers []int)
+
+	// NumLayers is used to validate the config's tap ids.
+	NumLayers() int
 }
 
 type Model struct {
 	FC         nn.LinearLayer
 	HiddenNorm *nn.RMSNorm
-	Layers     []*Layer
 	Norm       *nn.RMSNorm
+	Layers     []*Layer
 
-	target           base.Model
-	targetEmbeddings base.MTPEmbeddingModel
-	tensorPrefix     string
+	// AuxNorms, when shipped, normalize each target slice before fusion.
+	AuxNorms []*nn.RMSNorm
+
+	// ctxLayerNorm passes context rows through each layer's input norm, a
+	// laguna convention that neither tensors nor config indicate.
+	ctxLayerNorm bool
 
 	*Config
+
+	target draftTarget
+
+	tensorPrefix string
+
+	QuantGroupSize int
+	QuantBits      int
+	QuantMode      string
+	TensorQuant    map[string]*model.TensorQuantInfo
 }
 
 type Layer struct {
-	Attention         *Attention
-	MLP               *MLP
-	InputNorm         *nn.RMSNorm
-	PostAttentionNorm *nn.RMSNorm
+	InputNorm    *nn.RMSNorm
+	PostAttnNorm *nn.RMSNorm
+	Attention    *Attention
+	MLP          *MLP
+	IsSliding    bool
+	IsCausal     bool
 }
 
+// Attention holds a q projection and a fused k|v projection: split
+// checkpoints are stacked at load, fused ones sliced. Context rows produce
+// no queries, so the context path uses only KVProj.
 type Attention struct {
-	QProj nn.LinearLayer
-	KProj nn.LinearLayer
-	VProj nn.LinearLayer
-	OProj nn.LinearLayer
-	QNorm *nn.RMSNorm
-	KNorm *nn.RMSNorm
+	QProj  nn.LinearLayer
+	KVProj nn.LinearLayer
+	GProj  nn.LinearLayer
+	OProj  nn.LinearLayer
+	QNorm  *nn.RMSNorm
+	KNorm  *nn.RMSNorm
 
-	Sliding bool
+	// ctxInputNorm applies the layer's input norm to context rows (laguna).
+	ctxInputNorm *nn.RMSNorm
 }
 
 type MLP struct {
-	GateProj nn.LinearLayer
-	UpProj   nn.LinearLayer
-	DownProj nn.LinearLayer
+	// GateUpProj is gate|up stacked at load; SwiGLU splits the halves.
+	GateUpProj nn.LinearLayer
+	DownProj   nn.LinearLayer
 }
 
-func parseConfig(data []byte) (Config, error) {
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse dflash config: %w", err)
+func parseConfig(data []byte) (*Config, error) {
+	var raw struct {
+		HiddenSize        int32   `json:"hidden_size"`
+		NumHiddenLayers   int32   `json:"num_hidden_layers"`
+		NumAttentionHeads int32   `json:"num_attention_heads"`
+		NumKeyValueHeads  int32   `json:"num_key_value_heads"`
+		HeadDim           int32   `json:"head_dim"`
+		RMSNormEps        float32 `json:"rms_norm_eps"`
+		RopeTheta         float32 `json:"rope_theta"`
+		RopeParameters    struct {
+			RopeTheta float32 `json:"rope_theta"`
+		} `json:"rope_parameters"`
+		BlockSize    int `json:"block_size"`
+		DFlashConfig struct {
+			BlockSize       int    `json:"block_size"`
+			MaskTokenID     *int32 `json:"mask_token_id"`
+			TargetLayerIDs  []int  `json:"target_layer_ids"`
+			NumTargetLayers int    `json:"num_target_layers"`
+			Causal          *bool  `json:"causal"`
+		} `json:"dflash_config"`
+		NumTargetLayers int      `json:"num_target_layers"`
+		VocabSize       int32    `json:"vocab_size"`
+		LayerTypes      []string `json:"layer_types"`
+		SlidingWindow   int32    `json:"sliding_window"`
+		RopeInterleaved *bool    `json:"rope_interleaved"`
 	}
-	if cfg.HiddenSize <= 0 {
-		return Config{}, fmt.Errorf("invalid hidden_size: %d", cfg.HiddenSize)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse dflash config: %w", err)
 	}
-	if cfg.NumHiddenLayers <= 0 {
-		return Config{}, fmt.Errorf("invalid num_hidden_layers: %d", cfg.NumHiddenLayers)
+
+	cfg := &Config{
+		HiddenSize:        raw.HiddenSize,
+		NumHiddenLayers:   raw.NumHiddenLayers,
+		NumAttentionHeads: raw.NumAttentionHeads,
+		NumKeyValueHeads:  raw.NumKeyValueHeads,
+		HeadDim:           raw.HeadDim,
+		RMSNormEps:        raw.RMSNormEps,
+		RopeTheta:         raw.RopeTheta,
+		SlidingWindow:     raw.SlidingWindow,
+		LayerTypes:        raw.LayerTypes,
+		BlockSize:         raw.DFlashConfig.BlockSize,
+		VocabSize:         raw.VocabSize,
+		TargetLayerIDs:    raw.DFlashConfig.TargetLayerIDs,
+		Causal:            raw.DFlashConfig.Causal,
 	}
-	if cfg.NumAttentionHeads <= 0 {
-		return Config{}, fmt.Errorf("invalid num_attention_heads: %d", cfg.NumAttentionHeads)
-	}
-	if cfg.NumKeyValueHeads <= 0 {
-		cfg.NumKeyValueHeads = cfg.NumAttentionHeads
-	}
-	if cfg.HeadDim <= 0 {
-		if cfg.HiddenSize%cfg.NumAttentionHeads != 0 {
-			return Config{}, fmt.Errorf("hidden_size (%d) must be divisible by num_attention_heads (%d)", cfg.HiddenSize, cfg.NumAttentionHeads)
-		}
-		cfg.HeadDim = cfg.HiddenSize / cfg.NumAttentionHeads
-	}
-	if cfg.RMSNormEps == 0 {
-		cfg.RMSNormEps = 1e-6
+	if raw.RopeInterleaved != nil {
+		cfg.RopeInterleaved = *raw.RopeInterleaved
 	}
 	if cfg.RopeTheta == 0 {
-		ropeParams := cfg.RopeParameters
-		if ropeParams == nil {
-			ropeParams = cfg.RopeScaling
+		cfg.RopeTheta = raw.RopeParameters.RopeTheta
+	}
+	if cfg.BlockSize == 0 {
+		cfg.BlockSize = raw.BlockSize
+	}
+	cfg.Scale = float32(math.Pow(float64(cfg.HeadDim), -0.5))
+
+	if cfg.BlockSize < 2 {
+		return nil, fmt.Errorf("dflash block size %d must be at least 2", cfg.BlockSize)
+	}
+	if raw.DFlashConfig.MaskTokenID == nil {
+		return nil, fmt.Errorf("dflash config missing mask_token_id")
+	}
+	cfg.MaskTokenID = *raw.DFlashConfig.MaskTokenID
+	if len(cfg.TargetLayerIDs) == 0 {
+		return nil, fmt.Errorf("dflash config missing target_layer_ids")
+	}
+	for i, id := range cfg.TargetLayerIDs {
+		if id < 0 || (i > 0 && id <= cfg.TargetLayerIDs[i-1]) {
+			return nil, fmt.Errorf("dflash target_layer_ids must be ascending and non-negative")
 		}
-		if ropeParams != nil && ropeParams.RopeTheta > 0 {
-			cfg.RopeTheta = ropeParams.RopeTheta
-		}
 	}
-	if cfg.RopeTheta == 0 {
-		cfg.RopeTheta = 1000000
-	}
-	if cfg.BlockSizeValue <= 0 {
-		return Config{}, fmt.Errorf("invalid block_size: %d", cfg.BlockSizeValue)
-	}
-	if len(cfg.DFlash.TargetLayerIDs) == 0 {
-		return Config{}, fmt.Errorf("dflash_config.target_layer_ids is required")
-	}
-	if !sort.IntsAreSorted(cfg.DFlash.TargetLayerIDs) {
-		return Config{}, fmt.Errorf("dflash_config.target_layer_ids must be sorted")
+	if n := max(raw.NumTargetLayers, raw.DFlashConfig.NumTargetLayers); n > 0 && cfg.TargetLayerIDs[len(cfg.TargetLayerIDs)-1] >= n {
+		return nil, fmt.Errorf("dflash target layer %d out of range for %d target layers",
+			cfg.TargetLayerIDs[len(cfg.TargetLayerIDs)-1], n)
 	}
 	if len(cfg.LayerTypes) == 0 {
 		cfg.LayerTypes = make([]string, cfg.NumHiddenLayers)
@@ -146,32 +216,23 @@ func parseConfig(data []byte) (Config, error) {
 		}
 	}
 	if len(cfg.LayerTypes) != int(cfg.NumHiddenLayers) {
-		return Config{}, fmt.Errorf("layer_types length %d does not match num_hidden_layers %d", len(cfg.LayerTypes), cfg.NumHiddenLayers)
+		return nil, fmt.Errorf("dflash layer_types length %d != num_hidden_layers %d", len(cfg.LayerTypes), cfg.NumHiddenLayers)
 	}
-	for i, typ := range cfg.LayerTypes {
-		switch strings.ToLower(typ) {
+	for _, t := range cfg.LayerTypes {
+		switch t {
 		case "full_attention":
 		case "sliding_attention":
 			if cfg.SlidingWindow <= 0 {
-				return Config{}, fmt.Errorf("layer %d uses sliding_attention but sliding_window is not set", i)
+				return nil, fmt.Errorf("dflash sliding_attention layers require sliding_window")
 			}
 		default:
-			return Config{}, fmt.Errorf("unsupported layer type %q", typ)
+			return nil, fmt.Errorf("unsupported dflash layer type %q", t)
 		}
-	}
-	cfg.Scale = float32(1.0 / math.Sqrt(float64(cfg.HeadDim)))
-	cfg.RopeScale = 1
-	ropeParams := cfg.RopeParameters
-	if ropeParams == nil {
-		ropeParams = cfg.RopeScaling
-	}
-	if ropeParams != nil && strings.EqualFold(ropeParams.TypeName(), "yarn") {
-		cfg.RopeFreqs, cfg.RopeScale = nn.BuildYarnRopeFreqs(int(cfg.HeadDim), cfg.RopeTheta, ropeParams)
 	}
 	return cfg, nil
 }
 
-func newModel(root *model.Root, target base.Model) (base.DraftModel, error) {
+func newModel(root *model.Root, targetModel base.Model, ctxLayerNorm bool) (base.DraftModel, error) {
 	if root == nil || root.Draft == nil {
 		return nil, fmt.Errorf("draft metadata missing")
 	}
@@ -182,50 +243,65 @@ func newModel(root *model.Root, target base.Model) (base.DraftModel, error) {
 	}
 	configData, err := root.Manifest.ReadConfig(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("load dflash config: %w", err)
+		return nil, fmt.Errorf("load draft config: %w", err)
 	}
-
 	cfg, err := parseConfig(configData)
 	if err != nil {
 		return nil, err
 	}
-	if target.NumLayers() < int(cfg.NumTargetLayers) {
-		return nil, fmt.Errorf("dflash target expects %d layers, target has %d", cfg.NumTargetLayers, target.NumLayers())
-	}
-	for _, layerID := range cfg.DFlash.TargetLayerIDs {
-		if layerID < 0 || layerID >= target.NumLayers() {
-			return nil, fmt.Errorf("dflash target layer id %d out of range for %d-layer target", layerID, target.NumLayers())
-		}
-	}
-	targetEmbeddings, ok := target.(base.MTPEmbeddingModel)
+
+	target, ok := targetModel.(draftTarget)
 	if !ok {
-		return nil, fmt.Errorf("dflash draft requires target token embeddings, got %T", target)
+		return nil, fmt.Errorf("dflash draft is not supported with this target model")
 	}
 
-	if qt := root.QuantType(); qt != "" {
-		cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode = model.QuantizationParams(qt)
-		if gs := root.GroupSize(); gs > 0 {
-			cfg.QuantGroupSize = gs
-		}
-	} else {
-		cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode = model.QuantizationParams("")
+	var trained struct {
+		NumTargetLayers int `json:"num_target_layers"`
+		DFlashConfig    struct {
+			NumTargetLayers int `json:"num_target_layers"`
+		} `json:"dflash_config"`
 	}
-	cfg.TensorQuant = root.AllTensorQuant()
+	_ = json.Unmarshal(configData, &trained)
+	if n := max(trained.NumTargetLayers, trained.DFlashConfig.NumTargetLayers); n > 0 && n != target.NumLayers() {
+		return nil, fmt.Errorf("dflash draft trained for %d target layers, target has %d", n, target.NumLayers())
+	}
+	if last := cfg.TargetLayerIDs[len(cfg.TargetLayerIDs)-1]; last >= target.NumLayers() {
+		return nil, fmt.Errorf("dflash target layer %d out of range for %d target layers", last, target.NumLayers())
+	}
 
-	prefix := root.Draft.TensorPrefix
-	if prefix == "" {
-		prefix = "draft."
+	// The manifest can pair any draft with any target; probe the borrowed
+	// table and head (static shapes, nothing evaluated) to verify the fit.
+	emb := target.TokenEmbeddings(mlx.FromValues([]int32{0}, 1, 1))
+	if w := emb.Dim(2); w != int(cfg.HiddenSize) {
+		return nil, fmt.Errorf("dflash draft trained for hidden size %d, target has %d", cfg.HiddenSize, w)
+	}
+	vocab := target.RawLogits(emb).Dim(2)
+	if cfg.VocabSize > 0 && int(cfg.VocabSize) != vocab {
+		return nil, fmt.Errorf("dflash draft trained for a %d-token vocabulary, target has %d", cfg.VocabSize, vocab)
+	}
+	if cfg.MaskTokenID < 0 || int(cfg.MaskTokenID) >= vocab {
+		return nil, fmt.Errorf("dflash mask token %d outside the target's %d-token vocabulary", cfg.MaskTokenID, vocab)
+	}
+	target.SetAuxHiddenLayers(cfg.TargetLayerIDs)
+
+	tensorPrefix := root.Draft.TensorPrefix
+	if tensorPrefix == "" {
+		tensorPrefix = "draft."
 	}
 
 	m := &Model{
-		Config:           &cfg,
-		Layers:           make([]*Layer, cfg.NumHiddenLayers),
-		target:           target,
-		targetEmbeddings: targetEmbeddings,
-		tensorPrefix:     prefix,
+		Config:       cfg,
+		target:       target,
+		ctxLayerNorm: ctxLayerNorm,
+		tensorPrefix: tensorPrefix,
+		Layers:       make([]*Layer, cfg.NumHiddenLayers),
+		TensorQuant:  root.AllTensorQuant(),
 	}
-	for i := range m.Layers {
-		m.Layers[i] = &Layer{Attention: &Attention{}, MLP: &MLP{}}
+	if qt := root.QuantType(); qt != "" {
+		m.QuantGroupSize, m.QuantBits, m.QuantMode = model.QuantizationParams(qt)
+		if gs := root.GroupSize(); gs > 0 {
+			m.QuantGroupSize = gs
+		}
 	}
 	return m, nil
 }
@@ -234,85 +310,229 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	prefix := m.tensorPrefix
 	linears := model.NewLinearFactory(tensors, m.QuantGroupSize, m.QuantBits, m.QuantMode, m.TensorQuant)
 
-	m.FC = linears.Make(prefix + "fc")
-	if m.FC == nil {
+	if m.FC = linears.Make(prefix + "fc"); m.FC == nil {
 		return fmt.Errorf("missing dflash fc weight")
 	}
-	if w := tensors[prefix+"hidden_norm.weight"]; w != nil {
-		m.HiddenNorm = nn.NewRMSNorm(w, m.RMSNormEps)
-	}
-	if w := tensors[prefix+"norm.weight"]; w != nil {
-		m.Norm = nn.NewRMSNorm(w, m.RMSNormEps)
-	}
-	if m.HiddenNorm == nil || m.Norm == nil {
-		return fmt.Errorf("missing dflash norm weights")
+	for name, dst := range map[string]**nn.RMSNorm{
+		"hidden_norm.weight": &m.HiddenNorm,
+		"norm.weight":        &m.Norm,
+	} {
+		w := tensors[prefix+name]
+		if w == nil {
+			return fmt.Errorf("missing dflash %s", name)
+		}
+		*dst = nn.NewRMSNorm(w, m.RMSNormEps)
 	}
 
-	for i := range m.NumHiddenLayers {
+	for i := 0; ; i++ {
+		w := tensors[fmt.Sprintf("%saux_hidden_norms.%d.weight", prefix, i)]
+		if w == nil {
+			break
+		}
+		m.AuxNorms = append(m.AuxNorms, nn.NewRMSNorm(w, m.RMSNormEps))
+	}
+	if len(m.AuxNorms) > 0 && len(m.AuxNorms) != len(m.TargetLayerIDs) {
+		return fmt.Errorf("dflash has %d aux hidden norms for %d target layers", len(m.AuxNorms), len(m.TargetLayerIDs))
+	}
+
+	for i := range m.Layers {
 		layerPrefix := fmt.Sprintf("%slayers.%d", prefix, i)
 		layer := &Layer{
-			Attention: &Attention{Sliding: strings.ToLower(m.LayerTypes[i]) == "sliding_attention"},
+			IsSliding: m.LayerTypes[i] == "sliding_attention",
+			Attention: &Attention{
+				GProj: linears.Make(layerPrefix + ".self_attn.g_proj"),
+				OProj: linears.Make(layerPrefix + ".self_attn.o_proj"),
+			},
 			MLP: &MLP{
-				GateProj: linears.Make(layerPrefix + ".mlp.gate_proj"),
-				UpProj:   linears.Make(layerPrefix + ".mlp.up_proj"),
 				DownProj: linears.Make(layerPrefix + ".mlp.down_proj"),
 			},
+		}
+		a := layer.Attention
+		qDim := m.NumAttentionHeads * m.HeadDim
+		kvDim := m.NumKeyValueHeads * m.HeadDim
+		if fused := linears.Make(layerPrefix + ".self_attn.qkv_proj"); fused != nil {
+			a.QProj = sliceLinearRows(fused, 0, qDim)
+			a.KVProj = sliceLinearRows(fused, qDim, qDim+2*kvDim)
+		} else if q := linears.Make(layerPrefix + ".self_attn.q_proj"); q != nil {
+			k := linears.Make(layerPrefix + ".self_attn.k_proj")
+			v := linears.Make(layerPrefix + ".self_attn.v_proj")
+			if k != nil && v != nil {
+				kv, err := stackLinears(k, v)
+				if err != nil {
+					return fmt.Errorf("dflash layer %d k|v: %w", i, err)
+				}
+				a.QProj, a.KVProj = q, kv
+			}
+		}
+		if gate := linears.Make(layerPrefix + ".mlp.gate_proj"); gate != nil {
+			if up := linears.Make(layerPrefix + ".mlp.up_proj"); up != nil {
+				gu, err := stackLinears(gate, up)
+				if err != nil {
+					return fmt.Errorf("dflash layer %d gate|up: %w", i, err)
+				}
+				layer.MLP.GateUpProj = gu
+			}
+		}
+		layer.IsCausal = layer.IsSliding
+		if m.Causal != nil {
+			layer.IsCausal = *m.Causal
 		}
 		if w := tensors[layerPrefix+".input_layernorm.weight"]; w != nil {
 			layer.InputNorm = nn.NewRMSNorm(w, m.RMSNormEps)
 		}
 		if w := tensors[layerPrefix+".post_attention_layernorm.weight"]; w != nil {
-			layer.PostAttentionNorm = nn.NewRMSNorm(w, m.RMSNormEps)
+			layer.PostAttnNorm = nn.NewRMSNorm(w, m.RMSNormEps)
 		}
-		layer.Attention.QProj = linears.Make(layerPrefix + ".self_attn.q_proj")
-		layer.Attention.KProj = linears.Make(layerPrefix + ".self_attn.k_proj")
-		layer.Attention.VProj = linears.Make(layerPrefix + ".self_attn.v_proj")
-		layer.Attention.OProj = linears.Make(layerPrefix + ".self_attn.o_proj")
 		if w := tensors[layerPrefix+".self_attn.q_norm.weight"]; w != nil {
 			layer.Attention.QNorm = nn.NewRMSNorm(w, m.RMSNormEps)
 		}
 		if w := tensors[layerPrefix+".self_attn.k_norm.weight"]; w != nil {
 			layer.Attention.KNorm = nn.NewRMSNorm(w, m.RMSNormEps)
 		}
-
-		if layer.InputNorm == nil || layer.PostAttentionNorm == nil {
-			return fmt.Errorf("dflash layer %d: missing layer norms", i)
-		}
-		if layer.Attention.QProj == nil || layer.Attention.KProj == nil || layer.Attention.VProj == nil || layer.Attention.OProj == nil {
-			return fmt.Errorf("dflash layer %d: missing attention projections", i)
-		}
-		if layer.Attention.QNorm == nil || layer.Attention.KNorm == nil {
-			return fmt.Errorf("dflash layer %d: missing attention q/k norms", i)
-		}
-		if layer.MLP.GateProj == nil || layer.MLP.UpProj == nil || layer.MLP.DownProj == nil {
-			return fmt.Errorf("dflash layer %d: missing mlp projections", i)
+		if m.ctxLayerNorm {
+			layer.Attention.ctxInputNorm = layer.InputNorm
 		}
 
+		if a.QProj == nil || a.KVProj == nil || a.OProj == nil || a.QNorm == nil || a.KNorm == nil {
+			return fmt.Errorf("dflash layer %d: missing attention weights", i)
+		}
+		if layer.MLP.GateUpProj == nil || layer.MLP.DownProj == nil {
+			return fmt.Errorf("dflash layer %d: missing mlp weights", i)
+		}
+		if layer.InputNorm == nil || layer.PostAttnNorm == nil {
+			return fmt.Errorf("dflash layer %d: missing norm weights", i)
+		}
 		m.Layers[i] = layer
 	}
 	return nil
 }
 
-func (m *Model) TargetLayerIDs() []int {
-	return append([]int(nil), m.DFlash.TargetLayerIDs...)
+// stackLinears concatenates two linears along the output dimension. Quant
+// groups run along the input dimension, so this is exact; per-tensor global
+// scales are expanded to per-row so each half keeps its own.
+func stackLinears(a, b nn.LinearLayer) (nn.LinearLayer, error) {
+	if pa, ok := a.(*nn.Linear); ok {
+		pb, ok := b.(*nn.Linear)
+		if !ok {
+			return nil, fmt.Errorf("stack linears: mixed plain and quantized parts")
+		}
+		return &nn.Linear{
+			Weight: mlx.Concatenate([]*mlx.Array{pa.Weight, pb.Weight}, 0),
+			Bias:   concatBias(pa.Bias, int32(pa.Weight.Dim(0)), pb.Bias, int32(pb.Weight.Dim(0))),
+		}, nil
+	}
+	qa, ok := a.(*nn.QuantizedLinear)
+	if !ok {
+		return nil, fmt.Errorf("stack linears: unsupported layer type %T", a)
+	}
+	qb, ok := b.(*nn.QuantizedLinear)
+	if !ok {
+		return nil, fmt.Errorf("stack linears: mixed plain and quantized parts")
+	}
+	if qa.GroupSize != qb.GroupSize || qa.Bits != qb.Bits || qa.Mode != qb.Mode {
+		return nil, fmt.Errorf("stack linears: quant mode mismatch %s/%d/%d vs %s/%d/%d",
+			qa.Mode, qa.Bits, qa.GroupSize, qb.Mode, qb.Bits, qb.GroupSize)
+	}
+	if (qa.QBiases == nil) != (qb.QBiases == nil) {
+		return nil, fmt.Errorf("stack linears: quant bias layout mismatch")
+	}
+	out := &nn.QuantizedLinear{
+		Weight:    mlx.Concatenate([]*mlx.Array{qa.Weight, qb.Weight}, 0),
+		Scales:    mlx.Concatenate([]*mlx.Array{qa.Scales, qb.Scales}, 0),
+		GroupSize: qa.GroupSize,
+		Bits:      qa.Bits,
+		Mode:      qa.Mode,
+	}
+	if qa.QBiases != nil {
+		out.QBiases = mlx.Concatenate([]*mlx.Array{qa.QBiases, qb.QBiases}, 0)
+	}
+	out.Bias = concatBias(qa.Bias, int32(qa.Scales.Dim(0)), qb.Bias, int32(qb.Scales.Dim(0)))
+	if qa.GlobalScale != nil || qb.GlobalScale != nil {
+		out.GlobalScale = mlx.Concatenate([]*mlx.Array{
+			perRowGlobal(qa.GlobalScale, int32(qa.Scales.Dim(0))),
+			perRowGlobal(qb.GlobalScale, int32(qb.Scales.Dim(0))),
+		}, 0)
+	}
+	return out, nil
 }
 
-func (m *Model) BlockSize() int {
-	return int(m.BlockSizeValue)
+// perRowGlobal expands a per-tensor (or nil, meaning 1.0) global scale to a
+// per-row vector; an already per-row scale passes through unchanged.
+func perRowGlobal(g *mlx.Array, rows int32) *mlx.Array {
+	ones := make([]float32, rows)
+	for i := range ones {
+		ones[i] = 1
+	}
+	v := mlx.FromValues(ones, int(rows))
+	if g == nil {
+		return v
+	}
+	return mlx.Mul(v, g)
 }
 
-func (m *Model) MaskTokenID() int32 {
-	return m.DFlash.MaskTokenID
+func concatBias(a *mlx.Array, aRows int32, b *mlx.Array, bRows int32) *mlx.Array {
+	if a == nil && b == nil {
+		return nil
+	}
+	fill := func(bias *mlx.Array, rows int32, like *mlx.Array) *mlx.Array {
+		if bias != nil {
+			return bias
+		}
+		return mlx.ZerosF32([]int32{rows}).AsType(like.DType())
+	}
+	if a == nil {
+		a = fill(nil, aRows, b)
+	}
+	if b == nil {
+		b = fill(nil, bRows, a)
+	}
+	return mlx.Concatenate([]*mlx.Array{a, b}, 0)
 }
 
+// sliceLinearRows returns rows [start, stop) of l along the output dimension.
+func sliceLinearRows(l nn.LinearLayer, start, stop int32) nn.LinearLayer {
+	rows := func(t *mlx.Array) *mlx.Array {
+		if t == nil {
+			return nil
+		}
+		dims := t.Dims()
+		starts := make([]int32, len(dims))
+		stops := make([]int32, len(dims))
+		for i, d := range dims {
+			stops[i] = int32(d)
+		}
+		starts[0], stops[0] = start, stop
+		return mlx.SliceStartStop(t, starts, stops)
+	}
+	switch q := l.(type) {
+	case *nn.Linear:
+		return &nn.Linear{Weight: rows(q.Weight), Bias: rows(q.Bias)}
+	case *nn.QuantizedLinear:
+		g := q.GlobalScale
+		if g != nil && len(g.Dims()) == 1 && g.Dim(0) == q.Scales.Dim(0) {
+			g = rows(g)
+		}
+		return &nn.QuantizedLinear{
+			Weight:      rows(q.Weight),
+			Scales:      rows(q.Scales),
+			QBiases:     rows(q.QBiases),
+			Bias:        rows(q.Bias),
+			GlobalScale: g,
+			GroupSize:   q.GroupSize,
+			Bits:        q.Bits,
+			Mode:        q.Mode,
+		}
+	}
+	return nil
+}
+
+func (m *Model) BlockParams() (int, int32) { return m.BlockSize, m.MaskTokenID }
+
+// NewCaches builds the per-layer context caches.
 func (m *Model) NewCaches() []cache.Cache {
 	caches := make([]cache.Cache, len(m.Layers))
-	for i, typ := range m.LayerTypes {
-		if strings.ToLower(typ) == "sliding_attention" {
-			// RotatingKVCache.View returns maxSize-1 tokens so assistant
-			// paths can append the current query. DFlash uses that same
-			// view for target context, so allocate one extra slot to expose
-			// the draft model's sliding_window-1 context tokens.
+	for i, layer := range m.Layers {
+		if layer.IsSliding {
 			caches[i] = cache.NewRotatingKVCache(int(m.SlidingWindow))
 		} else {
 			caches[i] = cache.NewKVCache()
@@ -321,119 +541,139 @@ func (m *Model) NewCaches() []cache.Cache {
 	return caches
 }
 
-func (m *Model) AppendContext(targetHidden *mlx.Array, caches []cache.Cache) {
-	if targetHidden == nil || targetHidden.Dim(1) == 0 {
-		return
+func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
+	return m.target.RawLogits(x)
+}
+
+// Forward writes b.Hidden's rows into each layer's context cache starting at
+// SeqOffsets[0] and runs b.InputIDs as a block positioned after them; queries
+// come from the block only. Either input may be absent: with no block the
+// call just extends the context, with no context the block drafts from
+// whatever is already cached.
+func (m *Model) Forward(b *batch.Batch, _, draftCaches []cache.Cache) (hidden, auxHidden *mlx.Array) {
+	kv := draftCaches
+
+	var hctx *mlx.Array
+	nCtx := int32(0)
+	if b.Hidden != nil {
+		features := b.Hidden
+		if len(m.AuxNorms) > 0 {
+			slices := make([]*mlx.Array, len(m.AuxNorms))
+			for i, norm := range m.AuxNorms {
+				lo := int32(i) * m.HiddenSize
+				slices[i] = norm.Forward(features.Slice(mlx.Slice(), mlx.Slice(), mlx.Slice(int(lo), int(lo+m.HiddenSize))), m.RMSNormEps)
+			}
+			features = mlx.Concatenate(slices, -1)
+		}
+		hctx = m.HiddenNorm.Forward(m.FC.Forward(features), m.RMSNormEps)
+		nCtx = int32(b.Hidden.Dim(1))
 	}
-	hCtx := m.HiddenNorm.Forward(m.FC.Forward(targetHidden), m.RMSNormEps)
-	offset := int32(0)
-	if len(caches) > 0 && caches[0] != nil {
-		offset = int32(caches[0].Offset())
+	ctxPositions := mlx.FromValues([]int32{b.SeqOffsets[0]}, 1)
+
+	var h, blockPositions *mlx.Array
+	var bb *batch.Batch
+	var B, L int32
+	if b.InputIDs != nil {
+		dims := b.InputIDs.Dims()
+		B, L = int32(dims[0]), int32(dims[1])
+		h = m.target.TokenEmbeddings(b.InputIDs)
+		blockStart := b.SeqOffsets[0] + nCtx
+		bb = &batch.Batch{InputIDs: b.InputIDs, SeqOffsets: []int32{blockStart}, SeqQueryLens: b.SeqQueryLens}
+		blockPositions = mlx.FromValues([]int32{blockStart}, 1)
 	}
-	b := &batch.Batch{
-		InputIDs:     mlx.Zeros(mlx.DTypeInt32, targetHidden.Dim(0), targetHidden.Dim(1)),
-		SeqOffsets:   []int32{offset},
-		SeqQueryLens: []int32{int32(targetHidden.Dim(1))},
-	}
-	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
+
 	for i, layer := range m.Layers {
-		if i >= len(caches) || caches[i] == nil {
+		var ctxK, ctxV *mlx.Array
+		if hctx != nil {
+			ctxK, ctxV = layer.Attention.contextKV(hctx, ctxPositions, m.Config)
+		}
+		if h == nil {
+			if ctxK != nil {
+				kv[i].(cache.Attention).Update(b, ctxK, ctxV)
+			}
 			continue
 		}
-		layer.Attention.AppendContext(hCtx, b, positions, caches[i], m.Config)
-	}
-}
-
-func (m *Model) Draft(inputIDs *mlx.Array, caches []cache.Cache) *mlx.Array {
-	dims := inputIDs.Dims()
-	B, L := int32(dims[0]), int32(dims[1])
-	offset := int32(0)
-	if len(caches) > 0 && caches[0] != nil {
-		offset = int32(caches[0].Offset())
-	}
-	b := &batch.Batch{
-		InputIDs:     inputIDs,
-		SeqOffsets:   []int32{offset},
-		SeqQueryLens: []int32{L},
-	}
-	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
-
-	h := m.targetEmbeddings.TokenEmbeddings(inputIDs)
-	for i, layer := range m.Layers {
-		var c cache.Cache
-		if i < len(caches) {
-			c = caches[i]
+		var mask nn.AttentionMask
+		// A sliding layer's window comes from its cache, not from this mask.
+		if layer.IsCausal {
+			mask = nn.CausalMask()
 		}
-		h = layer.Forward(h, b, c, positions, B, L, m.Config)
+		h = layer.Forward(h, ctxK, ctxV, kv[i], bb, blockPositions, mask, B, L, m.Config)
 	}
-	logits := m.target.Unembed(m.Norm.Forward(h, m.RMSNormEps))
-	if m.FinalLogitSoftcapping != nil {
-		cap := mlx.FromValue(*m.FinalLogitSoftcapping).AsType(logits.DType())
-		logits = mlx.LogitSoftcap(logits, cap)
+	if h == nil {
+		return nil, nil
 	}
-	return logits
+	hidden = m.Norm.Forward(h, m.RMSNormEps)
+	return hidden, hidden
 }
 
-func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config) *mlx.Array {
-	h := mlx.Add(x, l.Attention.Forward(l.InputNorm.Forward(x, cfg.RMSNormEps), b, c, positions, B, L, cfg))
-	return mlx.Add(h, l.MLP.Forward(l.PostAttentionNorm.Forward(h, cfg.RMSNormEps)))
+func (l *Layer) Forward(x, ctxK, ctxV *mlx.Array, c cache.Cache, bb *batch.Batch, positions *mlx.Array, mask nn.AttentionMask, B, L int32, cfg *Config) *mlx.Array {
+	h := mlx.Add(x, l.Attention.Forward(l.InputNorm.Forward(x, cfg.RMSNormEps), ctxK, ctxV, c, bb, positions, mask, B, L, cfg))
+	return mlx.Add(h, l.MLP.Forward(l.PostAttnNorm.Forward(h, cfg.RMSNormEps)))
 }
 
-func (a *Attention) AppendContext(xCtx *mlx.Array, b *batch.Batch, positions *mlx.Array, c cache.Cache, cfg *Config) {
-	B, L := int32(xCtx.Dim(0)), int32(xCtx.Dim(1))
-	k := a.KProj.Forward(xCtx)
-	v := a.VProj.Forward(xCtx)
-
-	k = mlx.Reshape(k, B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
-	v = mlx.Reshape(v, B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+// contextKV projects feature rows into the layer's context K/V.
+func (a *Attention) contextKV(hctx *mlx.Array, positions *mlx.Array, cfg *Config) (k, v *mlx.Array) {
+	if a.ctxInputNorm != nil {
+		hctx = a.ctxInputNorm.Forward(hctx, cfg.RMSNormEps)
+	}
+	dims := hctx.Dims()
+	B, S := int32(dims[0]), int32(dims[1])
+	k, v = a.splitKV(a.KVProj.Forward(hctx), B, S, cfg)
 	k = a.KNorm.Forward(k, cfg.RMSNormEps)
-
 	k = mlx.Transpose(k, 0, 2, 1, 3)
 	v = mlx.Transpose(v, 0, 2, 1, 3)
-	k = nn.ScaleRotaryPart(mlx.RoPEWithFreqs(k, int(cfg.HeadDim), false, cfg.RopeTheta, 1.0, positions, cfg.RopeFreqs), int(cfg.HeadDim), cfg.RopeScale)
-
-	c.(cache.Attention).Update(b, k, v)
+	k = mlx.RoPEWithBase(k, int(cfg.HeadDim), cfg.RopeInterleaved, cfg.RopeTheta, 1.0, positions)
+	return k, v
 }
 
-func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config) *mlx.Array {
-	q := a.QProj.Forward(x)
-	propK := a.KProj.Forward(x)
-	propV := a.VProj.Forward(x)
+func (a *Attention) splitKV(kv *mlx.Array, B, L int32, cfg *Config) (k, v *mlx.Array) {
+	kvDim := cfg.NumKeyValueHeads * cfg.HeadDim
+	k = mlx.Reshape(mlx.SliceStartStop(kv, []int32{0, 0, 0}, []int32{B, L, kvDim}), B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+	v = mlx.Reshape(mlx.SliceStartStop(kv, []int32{0, 0, kvDim}, []int32{B, L, 2 * kvDim}), B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+	return k, v
+}
 
-	q = mlx.Reshape(q, B, L, cfg.NumAttentionHeads, cfg.HeadDim)
-	propK = mlx.Reshape(propK, B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
-	propV = mlx.Reshape(propV, B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+func (a *Attention) Forward(x, ctxK, ctxV *mlx.Array, c cache.Cache, bb *batch.Batch, positions *mlx.Array, mask nn.AttentionMask, B, L int32, cfg *Config) *mlx.Array {
+	q := mlx.Reshape(a.QProj.Forward(x), B, L, cfg.NumAttentionHeads, cfg.HeadDim)
+	k, v := a.splitKV(a.KVProj.Forward(x), B, L, cfg)
 
 	q = a.QNorm.Forward(q, cfg.RMSNormEps)
-	propK = a.KNorm.Forward(propK, cfg.RMSNormEps)
+	k = a.KNorm.Forward(k, cfg.RMSNormEps)
 
 	q = mlx.Transpose(q, 0, 2, 1, 3)
-	propK = mlx.Transpose(propK, 0, 2, 1, 3)
-	propV = mlx.Transpose(propV, 0, 2, 1, 3)
+	k = mlx.Transpose(k, 0, 2, 1, 3)
+	v = mlx.Transpose(v, 0, 2, 1, 3)
 
-	q = nn.ScaleRotaryPart(mlx.RoPEWithFreqs(q, int(cfg.HeadDim), false, cfg.RopeTheta, 1.0, positions, cfg.RopeFreqs), int(cfg.HeadDim), cfg.RopeScale)
-	propK = nn.ScaleRotaryPart(mlx.RoPEWithFreqs(propK, int(cfg.HeadDim), false, cfg.RopeTheta, 1.0, positions, cfg.RopeFreqs), int(cfg.HeadDim), cfg.RopeScale)
+	q = mlx.RoPEWithBase(q, int(cfg.HeadDim), cfg.RopeInterleaved, cfg.RopeTheta, 1.0, positions)
+	k = mlx.RoPEWithBase(k, int(cfg.HeadDim), cfg.RopeInterleaved, cfg.RopeTheta, 1.0, positions)
 
-	k, v := propK, propV
-	if viewer, ok := c.(cache.Viewer); ok {
-		if history := viewer.View(b); history != nil {
-			k = history.K().Concatenate(2, propK)
-			v = history.V().Concatenate(2, propV)
-		}
+	if ctxK != nil {
+		k = ctxK.Concatenate(2, k)
+		v = ctxV.Concatenate(2, v)
 	}
 
-	mask := nn.AttentionMask{}
-	if a.Sliding {
-		mask = nn.CausalMask()
-		if int(cfg.SlidingWindow) > 0 && k.Dim(2) > int(cfg.SlidingWindow) {
-			mask = mask.Intersect(nn.SlidingWindowMask(b, k.Dim(2), int(cfg.SlidingWindow), q.DType()))
-		}
+	// Write the context and block K/V together: a rollback point between two
+	// writes would force a wrapped rotating cache to copy its window out.
+	hist := c.(cache.Attention).Update(bb, k, v)
+
+	out := nn.ScaledDotProductAttention(bb, q, cfg.Scale, nn.WithKVHistory(hist), nn.WithMask(mask))
+	if a.GProj != nil {
+		// Per-head softplus output gate, applied before the head merge.
+		gate := mlx.ExpandDims(mlx.SoftplusF32(a.GProj.Forward(x)), -1)
+		out = mlx.Mul(mlx.Transpose(out, 0, 2, 1, 3), gate)
+		out = mlx.Reshape(out, B, L, cfg.NumAttentionHeads*cfg.HeadDim)
+	} else {
+		out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*cfg.HeadDim)
 	}
-	out := nn.ScaledDotProductAttention(b, q, cfg.Scale, nn.WithKV(k, v, []int32{int32(k.Dim(2))}), nn.WithMask(mask))
-	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*cfg.HeadDim)
 	return a.OProj.Forward(out)
 }
 
 func (m *MLP) Forward(x *mlx.Array) *mlx.Array {
-	return m.DownProj.Forward(mlx.SwiGLU(m.GateProj.Forward(x), m.UpProj.Forward(x)))
+	gu := m.GateUpProj.Forward(x)
+	dims := gu.Dims()
+	B, L, half := int32(dims[0]), int32(dims[1]), int32(dims[2])/2
+	gate := mlx.SliceStartStop(gu, []int32{0, 0, 0}, []int32{B, L, half})
+	up := mlx.SliceStartStop(gu, []int32{0, 0, half}, []int32{B, L, 2 * half})
+	return m.DownProj.Forward(mlx.SwiGLU(gate, up))
 }

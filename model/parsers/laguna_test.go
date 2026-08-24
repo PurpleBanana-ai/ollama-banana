@@ -20,6 +20,23 @@ func lagunaTestTools() []api.Tool {
 	}}
 }
 
+func lagunaParseChunks(t *testing.T, parser Parser, chunks ...string) (string, string, []api.ToolCall) {
+	t.Helper()
+
+	var content, thinking string
+	var calls []api.ToolCall
+	for i, chunk := range chunks {
+		chunkContent, chunkThinking, chunkCalls, err := parser.Add(chunk, i == len(chunks)-1)
+		if err != nil {
+			t.Fatalf("Add(%q, done=%t): %v", chunk, i == len(chunks)-1, err)
+		}
+		content += chunkContent
+		thinking += chunkThinking
+		calls = append(calls, chunkCalls...)
+	}
+	return content, thinking, calls
+}
+
 func TestLagunaParserToolCall(t *testing.T) {
 	parser := ParserForName("laguna")
 	if parser == nil {
@@ -375,30 +392,32 @@ func TestLagunaParserUserTaggedNonToolContent(t *testing.T) {
 	}
 }
 
-func TestLagunaParserThinkingDefaultsOn(t *testing.T) {
+func TestLagunaParserThinkingDefaultsOff(t *testing.T) {
+	// Thinking defaults off (matching the chat template); an emitted <think>
+	// block is suppressed rather than surfaced as reasoning.
 	parser := ParserForName("laguna")
 	parser.Init(nil, nil, nil)
 	content, thinking, calls, err := parser.Add("<think>Need to reason.</think>\nDirect answer.", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content != "Direct answer." || thinking != "Need to reason." || len(calls) != 0 {
+	if content != "Direct answer." || thinking != "" || len(calls) != 0 {
 		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
 	}
 }
 
-func TestLagunaParserThinkingDefaultsOnWhenToolsPresent(t *testing.T) {
+func TestLagunaParserThinkingDefaultsOffWhenToolsPresent(t *testing.T) {
 	parser := ParserForName("laguna")
 	parser.Init(lagunaTestTools(), nil, nil)
 	content, thinking, calls, err := parser.Add("<think>Need to reason.</think>\n<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if thinking != "Need to reason." || len(calls) != 1 {
+	if thinking != "" || len(calls) != 1 {
 		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
 	}
 	if content != "" {
-		t.Fatalf("content=%q, want thinking block suppressed from content when default thinking is enabled", content)
+		t.Fatalf("content=%q, want the suppressed think block and the tool call both removed from content", content)
 	}
 }
 
@@ -421,7 +440,7 @@ func TestLagunaParserThinkingExplicitlyDisabledDropsLeadingCloseTag(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content != "Tokyo\n" || thinking != "" || len(calls) != 0 {
+	if content != "Tokyo" || thinking != "" || len(calls) != 0 {
 		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
 	}
 }
@@ -433,31 +452,143 @@ func TestLagunaParserThinkingEnabledDropsLeadingCloseTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content != "Tokyo\n" || thinking != "" || len(calls) != 0 {
+	if content != "Tokyo" || thinking != "" || len(calls) != 0 {
 		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
 	}
 }
 
-func TestLagunaParserThinkingDefaultOnDropsLeadingCloseTag(t *testing.T) {
+func TestLagunaParserThinkingDefaultOffDropsLeadingCloseTag(t *testing.T) {
 	parser := ParserForName("laguna")
 	parser.Init(nil, nil, nil)
 	content, thinking, calls, err := parser.Add("</think>\nTokyo\n", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content != "Tokyo\n" || thinking != "" || len(calls) != 0 {
+	if content != "Tokyo" || thinking != "" || len(calls) != 0 {
 		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
 	}
 }
 
-func TestLagunaParserThinkingEnabledUntaggedAnswerIsContent(t *testing.T) {
+func TestLagunaParserThinkingEnabledUntaggedAnswerIsThinking(t *testing.T) {
+	// With thinking enabled the prompt primes <think>, so the model's output
+	// begins as reasoning even without an opening tag.
 	parser := ParserForName("laguna")
 	parser.Init(nil, nil, &api.ThinkValue{Value: true})
 	content, thinking, calls, err := parser.Add("Direct answer.", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content != "Direct answer." || thinking != "" || len(calls) != 0 {
+	if content != "" || thinking != "Direct answer." || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserAssistantPrefillContinuesAsContent(t *testing.T) {
+	// With thinking enabled but the request ending in an assistant prefill, the
+	// renderer continues the turn in place after a closed </think>, so the
+	// untagged continuation is content, not thinking. (Regression: previously
+	// Init ignored lastMessage and reported it all as thinking, leaving the
+	// client with an empty answer.)
+	parser := ParserForName("laguna")
+	parser.Init(nil, &api.Message{Role: "assistant", Content: "The answer is"}, &api.ThinkValue{Value: true})
+	content, thinking, calls, err := parser.Add(" 42.", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "42." || thinking != "" || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserAssistantPrefillContinuesAsToolCall(t *testing.T) {
+	// An assistant prefill with thinking enabled resumes past the closed
+	// </think>, so a tool call emitted by the continuation is parsed from the
+	// content state rather than being swallowed as thinking.
+	parser := ParserForName("laguna")
+	parser.Init(lagunaTestTools(), &api.Message{Role: "assistant", Thinking: "earlier reasoning"}, &api.ThinkValue{Value: true})
+	content, thinking, calls, err := parser.Add("<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "" || thinking != "" || len(calls) != 1 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+	if calls[0].Function.Name != "get_weather" {
+		t.Fatalf("name=%q, want get_weather", calls[0].Function.Name)
+	}
+}
+
+func TestLagunaParserNonAssistantLastMessageStillPrimesThinking(t *testing.T) {
+	// A trailing user message is not a prefill: the renderer primes <think>, so
+	// the untagged continuation is still reasoning.
+	parser := ParserForName("laguna")
+	parser.Init(nil, &api.Message{Role: "user", Content: "hi"}, &api.ThinkValue{Value: true})
+	content, thinking, calls, err := parser.Add("Direct answer.", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "" || thinking != "Direct answer." || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaV8ParserAssistantHistoryStillPrimesThinking(t *testing.T) {
+	// Laguna v8 closes assistant history and emits a fresh generation prompt,
+	// so an assistant tail message must not switch the parser into prefill mode.
+	parser := ParserForName("poolside-v1")
+	if parser == nil {
+		t.Fatal("expected poolside-v1 parser")
+	}
+	if !parser.HasToolSupport() || !parser.HasThinkingSupport() {
+		t.Fatal("poolside-v1 parser should advertise tools and thinking")
+	}
+
+	parser.Init(nil, &api.Message{Role: "assistant", Content: "Previous."}, &api.ThinkValue{Value: true})
+	content, thinking, calls, err := parser.Add("Reasoning.</think>Answer.", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "Answer." || thinking != "Reasoning." || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserStripsLeadingContentWhitespace(t *testing.T) {
+	// No-think prompts prime </think>, so the model emits a leading newline
+	// before content; the parser drops it.
+	parser := ParserForName("laguna")
+	parser.Init(nil, nil, &api.ThinkValue{Value: false})
+	content, thinking, calls, err := parser.Add("\nHello! How can I help?", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "Hello! How can I help?" || thinking != "" || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserStripsTrailingContentWhitespace(t *testing.T) {
+	parser := ParserForName("laguna")
+	parser.Init(nil, nil, &api.ThinkValue{Value: false})
+	content, _, _, err := parser.Add("Hello there.\n\n", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "Hello there." {
+		t.Fatalf("content=%q, want trailing whitespace stripped", content)
+	}
+}
+
+func TestLagunaParserPrimedThinkingThenContent(t *testing.T) {
+	// Thinking enabled: the prompt primes <think>, so output is
+	// "\n{reasoning}\n</think>\n{answer}" with no opening tag.
+	parser := ParserForName("laguna")
+	parser.Init(nil, nil, &api.ThinkValue{Value: true})
+	content, thinking, calls, err := parser.Add("\nReasoning here.\n</think>\nThe answer.", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "The answer." || thinking != "Reasoning here." || len(calls) != 0 {
 		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
 	}
 }
@@ -480,5 +611,91 @@ func TestLagunaParserSplitToolTag(t *testing.T) {
 	}
 	if content != "" || thinking != "" || len(calls) != 1 {
 		t.Fatalf("second chunk content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserPartialToolCallFakeoutInContent(t *testing.T) {
+	parser := ParserForName("laguna")
+	parser.Init(lagunaTestTools(), nil, nil)
+
+	content, thinking, calls := lagunaParseChunks(t, parser, "Document literal <tool_call", " fakeout")
+	if content != "Document literal <tool_call fakeout" || thinking != "" || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserPartialToolCallFakeoutInThinking(t *testing.T) {
+	parser := ParserForName("laguna")
+	parser.Init(lagunaTestTools(), nil, &api.ThinkValue{Value: true})
+
+	content, thinking, calls := lagunaParseChunks(t, parser, "<think>Document literal <tool_c", " fakeout")
+	if content != "" || thinking != "Document literal <tool_c fakeout" || len(calls) != 0 {
+		t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+	}
+}
+
+func TestLagunaParserPartialThinkOpenFakeoutInContent(t *testing.T) {
+	tests := []struct {
+		name       string
+		thinkValue *api.ThinkValue
+		last       *api.Message
+	}{
+		{
+			name: "default off",
+		},
+		{
+			name:       "explicit off",
+			thinkValue: &api.ThinkValue{Value: false},
+		},
+		{
+			name:       "enabled assistant prefill content",
+			thinkValue: &api.ThinkValue{Value: true},
+			last:       &api.Message{Role: "assistant", Content: "prefill"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := ParserForName("laguna")
+			parser.Init(nil, tt.last, tt.thinkValue)
+
+			content, thinking, calls := lagunaParseChunks(t, parser, "Document literal <think", " fakeout")
+			if content != "Document literal <think fakeout" || thinking != "" || len(calls) != 0 {
+				t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+			}
+		})
+	}
+}
+
+func TestLagunaParserPartialThinkCloseFakeoutAtContentStart(t *testing.T) {
+	tests := []struct {
+		name       string
+		thinkValue *api.ThinkValue
+		last       *api.Message
+	}{
+		{
+			name: "default off",
+		},
+		{
+			name:       "explicit off",
+			thinkValue: &api.ThinkValue{Value: false},
+		},
+		{
+			name:       "enabled assistant prefill content",
+			thinkValue: &api.ThinkValue{Value: true},
+			last:       &api.Message{Role: "assistant", Content: "prefill"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := ParserForName("laguna")
+			parser.Init(nil, tt.last, tt.thinkValue)
+
+			content, thinking, calls := lagunaParseChunks(t, parser, "</think", " fakeout")
+			if content != "</think fakeout" || thinking != "" || len(calls) != 0 {
+				t.Fatalf("content=%q thinking=%q calls=%d", content, thinking, len(calls))
+			}
+		})
 	}
 }

@@ -14,7 +14,7 @@ type Poolside struct{}
 
 var poolsideGOOS = runtime.GOOS
 
-func (p *Poolside) String() string { return "Pool" }
+func (p *Poolside) String() string { return "Poolside" }
 
 func poolsideUnsupportedError() error {
 	return fmt.Errorf("Warning: Poolside is not currently supported on Windows")
@@ -29,7 +29,7 @@ func (p *Poolside) args(model string, extra []string) []string {
 	return args
 }
 
-func (p *Poolside) Run(model string, args []string) error {
+func (p *Poolside) Run(model string, _ []LaunchModel, args []string) error {
 	if poolsideGOOS == "windows" {
 		return poolsideUnsupportedError()
 	}

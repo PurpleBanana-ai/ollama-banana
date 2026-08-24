@@ -259,6 +259,10 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -467,6 +471,26 @@ func (c *Client) CloudStatusExperimental(ctx context.Context) (*StatusResponse, 
 	}
 
 	return &status, nil
+}
+
+// WebSearchExperimental searches the web through the local server's
+// experimental web search endpoint.
+func (c *Client) WebSearchExperimental(ctx context.Context, req *WebSearchRequest) (*WebSearchResponse, error) {
+	var resp WebSearchResponse
+	if err := c.do(ctx, http.MethodPost, "/api/experimental/web_search", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// WebFetchExperimental fetches web page content through the local server's
+// experimental web fetch endpoint.
+func (c *Client) WebFetchExperimental(ctx context.Context, req *WebFetchRequest) (*WebFetchResponse, error) {
+	var resp WebFetchResponse
+	if err := c.do(ctx, http.MethodPost, "/api/experimental/web_fetch", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // Signout will signout a client for a local ollama server.

@@ -32,6 +32,15 @@ type Nemotron3NanoParser struct {
 func (p *Nemotron3NanoParser) HasToolSupport() bool     { return true }
 func (p *Nemotron3NanoParser) HasThinkingSupport() bool { return true }
 
+func (p *Nemotron3NanoParser) PreservedTokens() []string {
+	return []string{
+		nemotronThinkOpen,
+		nemotronThinkClose,
+		toolOpenTag,
+		toolCloseTag,
+	}
+}
+
 func (p *Nemotron3NanoParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.toolParser = &Qwen3CoderParser{}
 	p.toolParser.Init(tools, nil, nil)
@@ -134,10 +143,11 @@ func (p *Nemotron3NanoParser) emitThinking(bufStr string) string {
 	maxOverlap := max(thinkOverlap, toolOverlap)
 
 	if maxOverlap > 0 {
-		unambiguous := bufStr[:len(bufStr)-maxOverlap]
-		unambiguous = strings.TrimRightFunc(unambiguous, unicode.IsSpace)
+		beforePartialTag := bufStr[:len(bufStr)-maxOverlap]
+		ambiguousStart := len(beforePartialTag) - trailingWhitespaceLen(beforePartialTag)
+		unambiguous := bufStr[:ambiguousStart]
 		p.buffer.Reset()
-		p.buffer.WriteString(bufStr[len(bufStr)-maxOverlap:])
+		p.buffer.WriteString(bufStr[ambiguousStart:])
 		return unambiguous
 	}
 

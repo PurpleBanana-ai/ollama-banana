@@ -45,7 +45,7 @@ func ToFP8(x *Array) *Array {
 	return out
 }
 
-func Dequantize(w, scales, biases *Array, groupSize, bits int, mode string) *Array {
+func Dequantize(w, scales, biases *Array, groupSize, bits int, mode string, globalScale *Array) *Array {
 	cMode := C.CString(mode)
 	defer C.free(unsafe.Pointer(cMode))
 	optGroupSize := C.mlx_optional_int{value: C.int(groupSize), has_value: true}
@@ -58,8 +58,18 @@ func Dequantize(w, scales, biases *Array, groupSize, bits int, mode string) *Arr
 	}
 
 	out := New("DEQUANTIZE")
-	var globalScale C.mlx_array
-	C.mlx_dequantize(&out.ctx, w.ctx, scales.ctx, b, optGroupSize, optBits, cMode, globalScale, optDtype, DefaultStream().ctx)
+	var noGlobalScale C.mlx_array
+	C.mlx_dequantize(&out.ctx, w.ctx, scales.ctx, b, optGroupSize, optBits, cMode, noGlobalScale, optDtype, DefaultStream().ctx)
+	if globalScale != nil {
+		// The C-level global_scale argument is rejected on Metal; apply it on top.
+		gs := globalScale
+		if gs.Size() > 1 {
+			// A vector scale is per-row; bind it to the weight's leading axis.
+			gs = Reshape(gs, int32(gs.Size()), 1)
+		}
+		outType := out.DType()
+		out = Mul(out, gs).AsType(outType)
+	}
 	return out
 }
 
@@ -326,7 +336,7 @@ func TakeAlongAxis(a, indices *Array, axis int) *Array {
 	return a.TakeAlongAxis(indices, axis)
 }
 
-// Function-style wrappers matching imagegen API
+// Function-style wrappers for model code.
 
 func Add(a, b *Array) *Array {
 	return a.Add(b)
@@ -387,7 +397,7 @@ func SliceStartStop(a *Array, start, stop []int32) *Array {
 	cStart := make([]C.int, n)
 	cStop := make([]C.int, n)
 	cStrides := make([]C.int, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		cStart[i] = C.int(start[i])
 		cStop[i] = C.int(stop[i])
 		cStrides[i] = 1
@@ -451,6 +461,12 @@ func Sigmoid(a *Array) *Array {
 	return a.Sigmoid()
 }
 
+func Erf(a *Array) *Array {
+	out := New("ERF")
+	C.mlx_erf(&out.ctx, a.ctx, DefaultStream().ctx)
+	return out
+}
+
 func Exp(a *Array) *Array {
 	out := New("EXP")
 	C.mlx_exp(&out.ctx, a.ctx, DefaultStream().ctx)
@@ -472,6 +488,12 @@ func Sin(a *Array) *Array {
 func Cos(a *Array) *Array {
 	out := New("COS")
 	C.mlx_cos(&out.ctx, a.ctx, DefaultStream().ctx)
+	return out
+}
+
+func erf(a *Array) *Array {
+	out := New("ERF")
+	C.mlx_erf(&out.ctx, a.ctx, DefaultStream().ctx)
 	return out
 }
 
@@ -607,7 +629,7 @@ func collect(v reflect.Value, arrays *[]*Array, seen map[uintptr]bool) {
 		return
 	}
 
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return
 		}
@@ -636,14 +658,14 @@ func collect(v reflect.Value, arrays *[]*Array, seen map[uintptr]bool) {
 			}
 			return
 		}
-		for i := 0; i < v.NumField(); i++ {
+		for i := range v.NumField() {
 			field := v.Field(i)
 			if field.CanInterface() {
 				collect(field, arrays, seen)
 			}
 		}
 	case reflect.Slice:
-		for i := 0; i < v.Len(); i++ {
+		for i := range v.Len() {
 			collect(v.Index(i), arrays, seen)
 		}
 	case reflect.Map:

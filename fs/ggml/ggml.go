@@ -424,8 +424,12 @@ func (t TensorType) BlockSize() uint64 {
 		TensorTypeQ8_0,
 		TensorTypeQ8_1,
 		tensorTypeIQ4_NL,
-		4, TensorTypeMXFP4:
+		TensorTypeMXFP4:
 		return 32
+	case TensorTypeNVFP4:
+		return 64
+	case TensorTypeQ1_0:
+		return 128
 	default:
 		return 256
 	}
@@ -497,8 +501,12 @@ func (t TensorType) TypeSize() uint64 {
 		return blockSize/8 + blockSize/16 + blockSize/32
 	case TensorTypeBF16:
 		return 2
-	case 4, TensorTypeMXFP4:
+	case TensorTypeMXFP4:
 		return 1 + blockSize/2
+	case TensorTypeNVFP4:
+		return 4 + blockSize/2
+	case TensorTypeQ1_0:
+		return 2 + blockSize/8
 	default:
 		return 0
 	}
@@ -512,8 +520,47 @@ func (t Tensor) Elements() uint64 {
 	return count
 }
 
+func (t Tensor) elements() (uint64, bool) {
+	var count uint64 = 1
+	for _, n := range t.Shape {
+		if n != 0 && count > ^uint64(0)/n {
+			return 0, false
+		}
+		count *= n
+	}
+	return count, true
+}
+
 func (t Tensor) Size() uint64 {
 	return t.Elements() * t.typeSize() / t.blockSize()
+}
+
+func (t Tensor) size() (uint64, bool) {
+	elements, ok := t.elements()
+	if !ok {
+		return 0, false
+	}
+
+	typeSize := t.typeSize()
+	blockSize := t.blockSize()
+	if typeSize == 0 || blockSize == 0 {
+		return 0, false
+	}
+
+	rowSize := uint64(1)
+	if len(t.Shape) > 0 {
+		rowSize = t.Shape[0]
+	}
+	if rowSize%blockSize != 0 {
+		return 0, false
+	}
+
+	blocks := elements / blockSize
+	if blocks > ^uint64(0)/typeSize {
+		return 0, false
+	}
+
+	return blocks * typeSize, true
 }
 
 func (t Tensor) Type() string {
